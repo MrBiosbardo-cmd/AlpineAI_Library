@@ -1038,13 +1038,27 @@ def _retry_with_stricter_prompt(
     ]
     
     try:
-        response = CLIENT.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.0,  # Even stricter than normal
-            stream=False,
-        )
+        # Try with response_format first (if supported); fall back to without if not
+        try:
+            response = CLIENT.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.0,  # Even stricter than normal
+                stream=False,
+            )
+        except TypeError as e:
+            # response_format not supported; retry without it
+            if "response_format" in str(e):
+                response = CLIENT.chat.completions.create(
+                    model=LLM_MODEL,
+                    messages=messages,
+                    temperature=0.0,
+                    stream=False,
+                )
+            else:
+                raise
+        
         raw_response = response.choices[0].message.content or ""
         
         # Try all parsing attempts on the retry response

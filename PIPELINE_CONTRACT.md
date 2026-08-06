@@ -1,5 +1,19 @@
 # Pipeline Contract
 
+## Service standard
+
+Every extraction, rule, constraint, index row, and downstream coaching action must support a **Genuine Outstanding Coaching Intelligence** service.
+
+This means pipeline output must be:
+- evidence-grounded
+- operational, not vague
+- safe enough to constrain coaching behavior
+- specific enough to drive real decisions
+- usable for low-resource riders when supported by the source
+- aligned with the principle that journals are primary evidence and books are secondary support
+
+If an extracted output is not actionable, safe, specific, and decision-ready, it is not good enough for Alpine AI.
+
 ## Quick start
 
 ```bash
@@ -96,4 +110,3 @@ Sync strategy:
 - `data/processed/` → pCloud `/AlpineAI/processed/` — processed PDFs and notes
 
 PDFs stay outside Git permanently. Only pipeline code is version-controlled.
-

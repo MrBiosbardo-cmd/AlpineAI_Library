@@ -111,6 +111,8 @@ EXTRACTION_PROMPT = """
 You are a sports-science knowledge engineer for an elite cycling AI coach called Alpine AI.
 Your mission: extract metadata that enables GENUINE, OUTSTANDING coaching intelligence.
 Every field you fill in becomes a rule, a constraint, or a coaching decision the AI makes.
+Every output must be good enough to support a Genuine Outstanding Coaching Intelligence service.
+Output JSON only. Do not explain your reasoning. Do not include <think>, prose, markdown, or any surrounding text.
 
 Hierarchy rule: journals are primary evidence; books are secondary.
 
@@ -167,11 +169,15 @@ Scoring rules:
 - actionability_score: how directly findings translate to IF-THEN coaching rules (1.0 = explicit protocol given)
 - practical_application: MUST be written as concrete coaching actions, not vague summaries
 - low_resource_applicability: always fill — critical for Alpine AI's underserved riders
-- coaching_principles: distill 1-4 durable coaching truths this paper supports
-- constraints: list every hard rule this paper implies the coach MUST NOT violate
-- decision_rules: write as strict IF-THEN-ELSE logic the rule engine can execute
-- individualization_factors: list every variable that modifies how this rule applies to different riders
-- recovery_heuristics: list all specific recovery timing guidelines from this paper
+- coaching_principles: distill 1-4 durable coaching truths this paper supports, written as operational principles
+- constraints: list every hard rule this paper implies the coach MUST NOT violate, including safety and load ceilings
+- decision_rules: write as strict IF-THEN-ELSE logic the rule engine can execute; avoid commentary, qualifiers, and hedging
+- individualization_factors: list every variable that modifies how this rule applies to different riders and contexts
+- recovery_heuristics: list all specific recovery timing guidelines from this paper, with clear trigger conditions when possible
+- coaching-grade output: prefer precise, executable language over academic prose
+- service standard: every extracted field must be safe, specific, evidence-grounded, and decision-ready enough for a Genuine Outstanding Coaching Intelligence service
+- journal-priority guardrail: if DOI, ISSN, volume/issue, or article language is present, treat the source as journal-first
+- if the source is a journal article, never downgrade it to book-like content because it mentions a textbook concept
 - document_type must be one of the strict enum choices exactly
 """
 
@@ -245,12 +251,44 @@ def detect_priority(text: str, filename: str) -> str:
 
     doi_match  = re.search(r'\b10\.\d{4,}/\S+', combined)
     issn_match = re.search(r'issn\s*[\d\-x]+', combined)
+    journal_score = j_score
+    book_score = b_score
 
-    if doi_match or issn_match:
+    if doi_match:
+        journal_score += 3
+    if issn_match:
+        journal_score += 3
+    if re.search(r'\bjournal\b', combined):
+        journal_score += 2
+    if re.search(r'\bsystematic review\b', combined):
+        journal_score += 2
+    if re.search(r'\bmeta-analysis\b', combined):
+        journal_score += 2
+    if re.search(r'\bvol\.?\b', combined) or re.search(r'\bvolume\b', combined):
+        journal_score += 1
+    if re.search(r'\bissue\b', combined) or re.search(r'\bpages?\b', combined):
+        journal_score += 1
+    if re.search(r'\bmixed method study\b', combined) or re.search(r'\bstudy\b', combined):
+        journal_score += 1
+    if re.search(r'\bparticipants?\b', combined) or re.search(r'\bmethods?\b', combined):
+        journal_score += 1
+    if re.search(r'\babstract\b', combined) or re.search(r'\bresults?\b', combined):
+        journal_score += 1
+
+    if re.search(r'\bisbn(?:-1[03])?\b', combined):
+        book_score += 3
+    if re.search(r'\bpublisher\b|\bpress\b', combined):
+        book_score += 2
+    if re.search(r'\bedition\b|\bchapter\b', combined):
+        book_score += 1
+    if re.search(r'\bhandbook\b|\btextbook\b', combined):
+        book_score += 2
+
+    if journal_score >= book_score + 2:
         return "journal"
-    if j_score > b_score:
-        return "journal"
-    return "book"
+    if book_score >= journal_score + 2:
+        return "book"
+    return "journal" if journal_score >= book_score else "book"
 
 
 def clean_folder_name(name: str) -> str:
@@ -408,11 +446,58 @@ def _split_text_into_chunks(
     return chunks
 
 
+def _close_truncated_json(raw: str) -> str:
+    """
+    Close truncated JSON by balancing braces.
+    Handles cases where LLM response cuts off mid-response.
+    """
+    if not raw:
+        return ""
+    
+    text = raw.strip()
+    
+    # Count braces to detect truncation
+    open_braces = text.count("{")
+    close_braces = text.count("}")
+    open_brackets = text.count("[")
+    close_brackets = text.count("]")
+    
+    # Check if balanced
+    if open_braces <= close_braces and open_brackets <= close_brackets:
+        # Either balanced or more closes than opens; don't try to fix
+        return text
+    
+    # Truncated JSON - need to close it
+    # First, close any unterminated strings
+    # Count quotes to see if we're in an unterminated string
+    quote_count = text.count('"') - (text.count('\\"') if '\\' in text else 0)
+    
+    if quote_count % 2 != 0:
+        # Unterminated string; close it with a quote
+        text = text + '"'
+    
+    # Now close the missing braces and brackets
+    # Balance brackets first, then braces
+    missing_brackets = open_brackets - close_brackets
+    missing_braces = open_braces - close_braces
+    
+    # Add closing brackets
+    text = text + "]" * missing_brackets
+    # Add closing braces
+    text = text + "}" * missing_braces
+    
+    return text
+
+
 def _repair_json_text(raw: str) -> str:
     if not raw:
         return ""
 
     text = raw.strip()
+    
+    # First, try to close truncated JSON
+    text = _close_truncated_json(text)
+    
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
@@ -423,14 +508,22 @@ def _repair_json_text(raw: str) -> str:
     if start != -1 and end != -1 and end > start:
         text = text[start:end + 1]
 
-    replacements = {
-        "“": '"',
-        "”": '"',
-        "’": "'",
+    # Fix smart quotes (curly quotes) - do this multiple times to catch all variants
+    smartquote_replacements = {
+        """: '"',
+        """: '"',
+        "'": "'",
+        "'": "'",
+        "′": "'",
+        "″": '"',
     }
-    for old, new in replacements.items():
+    for old, new in smartquote_replacements.items():
         text = text.replace(old, new)
 
+    # Fix fields with missing values (e.g., "key":} or "key": ])
+    # Replace with "key":null or "key":[]
+    text = re.sub(r':\s*([}\]])', r':[]\1', text)  # Array-like fields get []
+    
     # Convert Python-ish literals to JSON literals.
     text = re.sub(r"\bNone\b", "null", text)
     text = re.sub(r"\bTrue\b", "true", text)
@@ -439,8 +532,22 @@ def _repair_json_text(raw: str) -> str:
     # Quote unquoted keys like: {title: "x"} or , authors: [...]
     text = re.sub(r'([,{]\s*)([A-Za-z_][A-Za-z0-9_\- ]*)(\s*:)', r'\1"\2"\3', text)
 
+    # Fix malformed closing patterns like: value,]}  ->  value]}
+    # This happens when an array/bracket is improperly nested
+    text = re.sub(r',\s*(\])', r'\1', text)  # Remove comma before ]
+    
     # Remove trailing commas before object/array close.
     text = re.sub(r",\s*([}\]])", r"\1", text)
+    
+    # Fix orphaned array close before object close at the end
+    # Pattern: ...value]} where the ] doesn't make sense structurally
+    # This is a heuristic - if we have ]} at the very end, remove the ]
+    if text.rstrip().endswith(']}'):
+        # Check if this looks like a malformed close
+        # Count unmatched brackets
+        if text.count('[') < text.count(']'):
+            # More closes than opens; remove the trailing ]
+            text = re.sub(r'\]\s*}\s*$', '}', text)
 
     return text
 
@@ -768,11 +875,53 @@ def _extract_json_object(raw: str) -> dict:
     return {}
 
 
+def _strip_leading_prose(raw: str) -> str:
+    """Strip reasoning/explanation before the first JSON object."""
+    if not raw:
+        return ""
+    
+    text = raw.strip()
+    # Find the first opening brace
+    brace_idx = text.find("{")
+    
+    if brace_idx > 0:
+        # Check if there's prose before the brace
+        before_brace = text[:brace_idx].strip()
+        if before_brace:
+            # There's prose before the JSON; strip it
+            return text[brace_idx:]
+    
+    return text
+
+
 def _parse_metadata_response(raw: str) -> tuple[dict, str]:
+    # Level 0: Try direct extraction (might work if already clean)
     parsed = _extract_json_object(raw)
     if parsed:
         return parsed, "ok"
 
+    # Level 1: Strip leading prose FIRST before any repair
+    prose_stripped = _strip_leading_prose(raw)
+    if prose_stripped != raw:
+        # Successfully stripped prose; try parsing the cleaned version
+        try:
+            parsed_prose = json.loads(prose_stripped)
+            if isinstance(parsed_prose, dict):
+                return parsed_prose, "json_repaired_prose_stripped"
+        except Exception:
+            pass
+        
+        # Try repair on the prose-stripped version
+        repaired_from_stripped = _repair_json_text(prose_stripped)
+        if repaired_from_stripped:
+            try:
+                repaired_obj = json.loads(repaired_from_stripped)
+                if isinstance(repaired_obj, dict):
+                    return repaired_obj, "json_repaired_from_prose_strip"
+            except Exception:
+                pass
+
+    # Level 2: Try repair on original raw (if no prose was stripped)
     repaired_text = _repair_json_text(raw)
     if repaired_text:
         try:
@@ -782,7 +931,149 @@ def _parse_metadata_response(raw: str) -> tuple[dict, str]:
         except Exception:
             pass
 
+    # Level 3: Try fenced code blocks
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        try:
+            fenced_obj = json.loads(fenced.group(1))
+            if isinstance(fenced_obj, dict):
+                return fenced_obj, "json_repaired"
+        except Exception:
+            pass
+
     return {}, "json_parse_error"
+
+
+def _build_deterministic_fallback(chunk_text: str, priority: str, raw_response: str = "") -> dict:
+    """
+    Level 3: Deterministic fallback extractor.
+    Fills critical fields from rule-based extraction when LLM fails.
+    """
+    # Extract first ~100 words as description if no LLM output
+    words = chunk_text.split()[:100]
+    description = " ".join(words) if words else "Unable to extract description"
+    
+    # Try to detect domain from keywords
+    domain = "General"
+    sub_topic = "Unknown"
+    
+    text_lower = (chunk_text + raw_response).lower()
+    
+    domain_keywords = {
+        "Training_Prescription": ["interval", "workout", "training", "session", "ride", "effort", "intensity"],
+        "Recovery": ["recovery", "rest", "sleep", "fatigue", "overreaching", "overtraining"],
+        "Female_Physiology": ["female", "women", "menstrual", "menopause", "pregnancy", "hormone"],
+        "Durability": ["chronic", "long-term", "sustainability", "injury prevention", "joint", "career"],
+        "Nutrition": ["nutrition", "diet", "carbohydrate", "protein", "fuel", "hydration"],
+        "Load_Monitoring": ["tss", "training stress", "load", "rpm", "watt", "power"],
+    }
+    
+    for dom, keywords in domain_keywords.items():
+        if any(kw in text_lower for kw in keywords):
+            domain = dom
+            break
+    
+    return {
+        "Domain": domain,
+        "Sub_Topic": sub_topic,
+        "Decision_Rules": description,
+        "Constraints": "Extracted via deterministic fallback (LLM failed)",
+        "Coaching_Principles": "",
+        "Individualization_Factors": "",
+        "Recovery_Heuristics": "",
+        "Evidence_Type": "Unknown",
+        "Key_Insights": "",
+        "Practical_Application": "",
+        "Athlete_Profile_Relevance": "Unknown",
+    }
+
+
+def _retry_with_stricter_prompt(
+    chunk_text: str,
+    priority: str,
+    pdf_path: Path,
+    chunk_index: int,
+    total_chunks: int,
+) -> tuple[dict, str]:
+    """
+    Level 2: Retry extraction with a shorter chunk and stricter "JSON only" prompt.
+    Returns (parsed_dict, status_reason).
+    """
+    # Use shorter chunk (50% of original)
+    words = chunk_text.split()
+    shorter_chunk = " ".join(words[:len(words) // 2])
+    
+    if not shorter_chunk.strip():
+        return {}, "level2_chunk_too_short"
+    
+    strict_prompt = (
+        "You are a JSON extractor. Return ONLY valid JSON object. "
+        "No text before or after. No explanations. No markdown. Just raw JSON.\n\n"
+        "JSON structure:\n"
+        "{\n"
+        '  "Domain": "string",\n'
+        '  "Sub_Topic": "string",\n'
+        '  "Decision_Rules": "string",\n'
+        '  "Constraints": "string",\n'
+        '  "Coaching_Principles": "string",\n'
+        '  "Individualization_Factors": "string",\n'
+        '  "Recovery_Heuristics": "string",\n'
+        '  "Evidence_Type": "string",\n'
+        '  "Key_Insights": "string",\n'
+        '  "Practical_Application": "string",\n'
+        '  "Athlete_Profile_Relevance": "string"\n'
+        "}"
+    )
+    
+    messages = [
+        {"role": "system", "content": strict_prompt},
+        {
+            "role": "user",
+            "content": (
+                f"Source priority: {priority}\n"
+                f"Chunk {chunk_index}/{total_chunks} (retry with shorter text)\n\n"
+                f"Text:\n{shorter_chunk[:MAX_CHARS]}"
+            )
+        }
+    ]
+    
+    try:
+        response = CLIENT.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.0,  # Even stricter than normal
+            stream=False,
+        )
+        raw_response = response.choices[0].message.content or ""
+        
+        # Try all parsing attempts on the retry response
+        parsed = _extract_json_object(raw_response)
+        if parsed:
+            return parsed, "level2_success_direct"
+        
+        prose_stripped = _strip_leading_prose(raw_response)
+        if prose_stripped != raw_response:
+            try:
+                parsed = json.loads(prose_stripped)
+                if parsed:
+                    return parsed, "level2_success_prose_stripped"
+            except Exception:
+                pass
+        
+        repaired = _repair_json_text(raw_response)
+        if repaired:
+            try:
+                parsed = json.loads(repaired)
+                if parsed:
+                    return parsed, "level2_success_repaired"
+            except Exception:
+                pass
+        
+        return {}, "level2_failed_no_valid_json"
+    
+    except Exception as e:
+        return {}, f"level2_failed_llm_error: {str(e)[:50]}"
 
 
 def _request_metadata_once(messages: list[dict]) -> str:
@@ -870,25 +1161,47 @@ def extract_metadata(text: str, priority: str, pdf_path: Path) -> dict:
             continue
 
         parsed, parse_reason = _parse_metadata_response(raw_response)
+        
+        # ─ RECOVERY STACK: Three levels of fallback ─
         if parse_reason == "json_parse_error":
             _log_failure_reason(
                 "json_parse_error",
-                f"{pdf_path.name} chunk {idx}/{len(chunks)}"
+                f"{pdf_path.name} chunk {idx}/{len(chunks)} - attempting Level 2 retry"
             )
-            _save_failed_chunk(
-                pdf_name=pdf_path.name,
-                chunk_index=idx,
-                reason="json_parse_error",
-                raw_response=raw_response,
-                priority=priority,
-                chunk_preview=chunk_preview,
-                error_message="json_repair_failed",
+            
+            # Level 2: Retry with stricter prompt and shorter chunk
+            parsed, level2_reason = _retry_with_stricter_prompt(
+                chunk,
+                priority,
+                pdf_path,
+                idx,
+                len(chunks)
             )
-            continue
-
-        if parse_reason == "json_repaired":
+            
+            if parsed and "level2_success" in level2_reason:
+                _log_failure_reason(level2_reason, f"{pdf_path.name} chunk {idx}/{len(chunks)}")
+                aggregated = _merge_metadata(aggregated, parsed)
+                successful_chunks += 1
+                continue
+            else:
+                _log_failure_reason(
+                    level2_reason,
+                    f"{pdf_path.name} chunk {idx}/{len(chunks)} - attempting Level 3 fallback"
+                )
+                
+                # Level 3: Deterministic fallback
+                parsed = _build_deterministic_fallback(chunk, priority, raw_response)
+                _log_failure_reason(
+                    "level3_deterministic_fallback",
+                    f"{pdf_path.name} chunk {idx}/{len(chunks)}: fallback applied"
+                )
+                aggregated = _merge_metadata(aggregated, parsed)
+                successful_chunks += 1
+                continue
+        
+        if parse_reason == "json_repaired" or parse_reason == "json_repaired_prose_stripped":
             _log_failure_reason(
-                "json_repaired",
+                parse_reason,
                 f"{pdf_path.name} chunk {idx}/{len(chunks)}"
             )
 
@@ -1247,4 +1560,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

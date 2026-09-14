@@ -122,21 +122,27 @@ Output JSON only. Do not explain your reasoning. Do not include <think>, prose, 
 
 Hierarchy rule: journals are primary evidence; books are secondary.
 
+CRITICAL — do not output placeholder or fabricated content:
+- Never output the literal word "string" (or any other JSON-type name) as a field's value. Every example below marked "string" is a TYPE hint, not a value to copy — if you cannot determine the real value from the source text, use an empty string "" (or empty list [] for array fields) instead.
+- Never invent author names such as "John Doe", "Jane Smith", "Author Name", "Unknown Author", or generic placeholder surnames. If the true authors cannot be identified from the text, return an empty list [].
+- Never pad a list field with filler items to reach some target count (e.g. "Principle 1", "Tag 2", "Encoded finding"). Only include items backed by genuine, specific content you found in the source text — a short, real list is better than a padded one.
+- If the source text is too garbled, truncated, or unreadable to extract real content, do not fabricate plausible-sounding findings — set completeness_score and extraction_confidence low and leave the affected fields empty instead.
+
 Return ONLY valid JSON with EXACTLY these fields:
 
 {
-  "title":                      "string",
-  "authors":                    ["string"],
-  "year":                       "string",
+  "title":                      "<exact paper title as printed in the source text>",
+  "authors":                    ["<full author name as printed>"],
+  "year":                       "<4-digit publication year, or empty string if not stated>",
   "document_type":              "journal_article | book | book_chapter | report | thesis | other",
   "evidence_type":              "journal_article | systematic_review | meta_analysis | consensus_statement | book | book_chapter",
-  "source":                     "string",
-  "domain":                     "string (e.g. Load_Monitoring, Recovery, Nutrition, Training_Prescription, Female_Physiology, Environmental, AI_Data_Science, Core_Physiology, Durability)",
-  "sub_topic":                  "string (e.g. HRV_Monitoring, Fueling_Strategies, Sleep_Optimization)",
-  "sport":                      "string",
-  "population":                 "string",
-  "sample_size":                "string",
-  "training_level":             "string",
+  "source":                     "<journal name, publisher, or book title as printed>",
+  "domain":                     "<one domain, e.g. Load_Monitoring, Recovery, Nutrition, Training_Prescription, Female_Physiology, Environmental, AI_Data_Science, Core_Physiology, Durability>",
+  "sub_topic":                  "<specific sub-topic, e.g. HRV_Monitoring, Fueling_Strategies, Sleep_Optimization>",
+  "sport":                      "<primary sport studied, e.g. cycling, running, triathlon>",
+  "population":                 "<studied population as described, e.g. 'trained male road cyclists'>",
+  "sample_size":                "<number of participants as stated, or empty string if not stated>",
+  "training_level":             "<e.g. recreational, trained, elite, or empty string if not stated>",
   "cycling_specificity":        "High | Medium | Low",
   "elite_applicability":        "High | Medium | Low",
   "resource_level":             "Low | Medium | High",
@@ -162,7 +168,7 @@ Return ONLY valid JSON with EXACTLY these fields:
 
   "completeness_score":         "float 0.0-1.0",
   "actionability_score":        "float 0.0-1.0",
-  "tags":                       ["string"],
+  "tags":                       ["<short topical keyword actually relevant to this paper>"],
   "related_papers":             ["AuthorLastName_Year_ShortDescriptor"],
   "linked_features":            ["Recovery Score | Adaptive FTP | Fatigue Warnings | Training Load Alerts | Nutrition Timing Engine | Environmental Adaptation"],
   "extraction_confidence":      "float 0.0-1.0"
@@ -912,6 +918,65 @@ def classify_document_type(text: str, data: dict, filename: str = "") -> tuple[s
     return rule_type, rule_conf, reason
 
 
+# ─────────────────────────────────────────
+
+# EXTRACTION QUALITY VALIDATION
+
+# ─────────────────────────────────────────
+
+_PLACEHOLDER_LIST_ITEM_RE = re.compile(
+    r"^\s*(Tag|Principle|Constraint|Rule|Factor|Heuristic|Feature|RelatedPaper)\s*\d+\s*$",
+    re.IGNORECASE,
+)
+_ENCODED_PREFIX_RE = re.compile(r"^\s*Encoded\b", re.IGNORECASE)
+_FAKE_AUTHOR_MARKERS = {
+    "john doe", "jane smith", "author name", "unknown author",
+    "authorlastname", "not specified in the text", "anonymous author",
+}
+_LIST_FIELDS_TO_CHECK = (
+    "coaching_principles", "constraints", "decision_rules",
+    "individualization_factors", "recovery_heuristics", "tags",
+    "related_papers", "linked_features",
+)
+_SCALAR_FIELDS_TO_CHECK = ("title", "year", "source", "sport", "population", "sample_size", "training_level")
+
+
+def detect_extraction_quality_issues(data: dict, pdf_path: Path) -> list[str]:
+    """Catch known LLM extraction failure signatures before they get written
+    to the index: literal schema-placeholder leaks, padded/numbered filler
+    list items, and fabricated placeholder author names.
+
+    A title-vs-filename word-overlap check was tried and dropped: measured
+    against the current library, the genuine fabrication case it was meant
+    to catch (jaccard ~0.09) sat in the middle of a long tail of completely
+    legitimate papers whose PDF filename just doesn't match their real title
+    (book chapters, generic download names, retitled papers) - no threshold
+    separated the two, so it added noise without adding signal.
+    """
+    issues: list[str] = []
+
+    for field in _SCALAR_FIELDS_TO_CHECK:
+        val = str(data.get(field, "")).strip()
+        if val.lower() == "string":
+            issues.append(f"literal_placeholder_string_in_{field}")
+
+    authors = data.get("authors", []) or []
+    for a in authors:
+        if str(a).strip().lower() in _FAKE_AUTHOR_MARKERS:
+            issues.append("fabricated_placeholder_author_name")
+            break
+
+    for field in _LIST_FIELDS_TO_CHECK:
+        items = data.get(field, []) or []
+        for item in items:
+            item_str = str(item).strip()
+            if _PLACEHOLDER_LIST_ITEM_RE.match(item_str) or _ENCODED_PREFIX_RE.match(item_str):
+                issues.append(f"numbered_placeholder_item_in_{field}")
+                break
+
+    return issues
+
+
 def reclassify_existing_rows(existing_rows: list) -> tuple[list, list, int]:
     if not existing_rows:
         return existing_rows, [], 0
@@ -1542,8 +1607,16 @@ def process_pdf(pdf_path: Path, existing_rows: list, id_floor: int = 0) -> dict 
     doc_type, doc_type_confidence, doc_type_reason = classify_document_type(text, data, pdf_path.name)
     data["document_type"] = doc_type
     data["doc_type_confidence"] = doc_type_confidence
-    manual_review_required = "yes" if doc_type_confidence == "low" else "no"
-    if manual_review_required == "yes":
+
+    # Extraction quality validation: catch placeholder leaks, padded list
+    # items, and fabricated author names before they get written to the
+    # index looking like legitimate content.
+    quality_issues = detect_extraction_quality_issues(data, pdf_path)
+    for issue in quality_issues:
+        _log_failure_reason("extraction_quality_issue", f"{pdf_path.name}: {issue}")
+
+    manual_review_required = "yes" if (doc_type_confidence == "low" or quality_issues) else "no"
+    if doc_type_confidence == "low":
         _log_failure_reason("doc_type_low_confidence", f"{pdf_path.name}: {doc_type_reason}")
 
     # Resolve folders
@@ -1639,6 +1712,9 @@ def process_pdf(pdf_path: Path, existing_rows: list, id_floor: int = 0) -> dict 
     }
 
     if manual_review_required == "yes":
+        reasons = list(quality_issues)
+        if doc_type_confidence == "low":
+            reasons.append(doc_type_reason)
         save_manual_review_queue(
             [
                 {
@@ -1647,7 +1723,7 @@ def process_pdf(pdf_path: Path, existing_rows: list, id_floor: int = 0) -> dict 
                     "Year": row.get("Year", ""),
                     "Document_Type": row.get("Document_Type", ""),
                     "Doc_Type_Confidence": row.get("Doc_Type_Confidence", ""),
-                    "Manual_Review_Reason": doc_type_reason,
+                    "Manual_Review_Reason": "; ".join(reasons) if reasons else "unspecified",
                     "Source": row.get("Source", ""),
                     "Evidence_Type": row.get("Evidence_Type", ""),
                     "PDF_Filename": row.get("PDF_Filename", ""),

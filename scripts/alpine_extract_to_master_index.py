@@ -32,8 +32,8 @@ NOTES_ROOT     = BASE_DIR / "data" / "processed" / "notes"
 INDEX_FILE     = BASE_DIR / "data" / "indexes" / "Master_Index.csv"
 MANUAL_REVIEW_FILE = BASE_DIR / "data" / "indexes" / "Manual_Review_Queue.csv"
 
-MAX_OCR_PAGES  = 10
-MAX_CHARS      = 28000
+MAX_OCR_PAGES  = 999   # OCR all pages (capped by MAX_CHARS budget)
+MAX_CHARS      = 500000  # ~500k chars allows full books to be chunked properly
 TODAY          = date.today().isoformat()
 
 # Extraction reliability settings
@@ -100,6 +100,12 @@ VALID_HML = {"High", "Medium", "Low"}
 VALID_DOCUMENT_TYPES = {
     "journal_article", "book", "book_chapter", "report", "thesis", "other"
 }
+
+BEGINNER_FOUNDATION_KEYWORDS = (
+    "beginner", "beginners", "novice", "novices", "foundational", "foundation",
+    "consistency", "adherence", "compliance", "early stage", "early-stage",
+    "returning", "rebuilding", "progression", "progressive overload",
+)
 
 # ─────────────────────────────────────────
 
@@ -295,7 +301,50 @@ def clean_folder_name(name: str) -> str:
     return re.sub(r'[^\w]', '_', name).strip('_')
 
 
-def generate_paper_id(existing_rows: list) -> str:
+_PAPER_ID_FRONTMATTER_RE = re.compile(r"^paper_id:\s*ALP-(\d+)-(\d+)\s*$", re.MULTILINE)
+
+
+def _max_paper_id_num_in_notes(prefix: str) -> int:
+    """Highest Paper_ID number ever written to a note file, even if
+    Master_Index.csv has since been trimmed, reset, or rebuilt. Notes are
+    never deleted by cleanup scripts, so this is the durable high-water mark."""
+    max_num = 0
+    if not NOTES_ROOT.exists():
+        return max_num
+    for note_path in NOTES_ROOT.rglob("*.md"):
+        try:
+            head = note_path.read_text(encoding="utf-8", errors="ignore")[:500]
+        except OSError:
+            continue
+        m = _PAPER_ID_FRONTMATTER_RE.search(head)
+        if m and f"ALP-{m.group(1)}-" == prefix:
+            max_num = max(max_num, int(m.group(2)))
+    return max_num
+
+
+def _max_paper_id_num_in_manual_review(prefix: str) -> int:
+    max_num = 0
+    if not MANUAL_REVIEW_FILE.exists():
+        return max_num
+    with open(MANUAL_REVIEW_FILE, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            pid = row.get("Paper_ID", "")
+            if pid.startswith(prefix) and pid.split("-")[-1].isdigit():
+                max_num = max(max_num, int(pid.split("-")[-1]))
+    return max_num
+
+
+def paper_id_floor() -> int:
+    """Durable high-water mark for Paper_ID numbering, independent of the
+    current (possibly-trimmed) Master_Index.csv. Call once per run."""
+    prefix = f"ALP-{date.today().year}-"
+    return max(
+        _max_paper_id_num_in_notes(prefix),
+        _max_paper_id_num_in_manual_review(prefix),
+    )
+
+
+def generate_paper_id(existing_rows: list, floor: int = 0) -> str:
     year = date.today().year
     prefix = f"ALP-{year}-"
     used_nums = [
@@ -303,7 +352,7 @@ def generate_paper_id(existing_rows: list) -> str:
         for r in existing_rows
         if r.get("Paper_ID", "").startswith(prefix) and r["Paper_ID"].split("-")[-1].isdigit()
     ]
-    next_num = max(used_nums, default=0) + 1
+    next_num = max(used_nums + [floor], default=0) + 1
     return f"{prefix}{next_num:04d}"
 
 
@@ -671,6 +720,90 @@ def _build_doc_signal_blob(text: str, data: dict, filename: str = "") -> str:
         text[:20000],
     ]
     return "\n".join(parts).lower()
+
+
+def _contains_beginner_foundation_signals(*values: str) -> bool:
+    blob = " ".join(str(value or "").lower() for value in values)
+    return any(keyword in blob for keyword in BEGINNER_FOUNDATION_KEYWORDS)
+
+
+def _enrich_beginner_foundation_metadata(data: dict) -> dict:
+    enriched = dict(data or {})
+    if not _contains_beginner_foundation_signals(
+        enriched.get("title", ""),
+        enriched.get("main_finding", ""),
+        enriched.get("practical_application", ""),
+        enriched.get("low_resource_applicability", ""),
+        " ".join(enriched.get("coaching_principles", []) if isinstance(enriched.get("coaching_principles", []), list) else []),
+        " ".join(enriched.get("decision_rules", []) if isinstance(enriched.get("decision_rules", []), list) else []),
+        " ".join(enriched.get("tags", []) if isinstance(enriched.get("tags", []), list) else []),
+        enriched.get("training_level", ""),
+        enriched.get("population", ""),
+    ):
+        return enriched
+
+    tags = list(enriched.get("tags", []) or [])
+    for tag in ("beginner_foundation", "consistency", "progression"):
+        if tag not in tags:
+            tags.append(tag)
+    enriched["tags"] = tags
+
+    domain = str(enriched.get("domain", "")).strip()
+    if not domain or domain.lower() == "general":
+        enriched["domain"] = "Training_Prescription"
+
+    sub_topic = str(enriched.get("sub_topic", "")).strip()
+    if not sub_topic or sub_topic.lower() in {"general", "unknown"}:
+        enriched["sub_topic"] = "Beginner_Progression"
+
+    principles = list(enriched.get("coaching_principles", []) or [])
+    decisions = list(enriched.get("decision_rules", []) or [])
+    constraints = list(enriched.get("constraints", []) or [])
+    heuristics = list(enriched.get("recovery_heuristics", []) or [])
+
+    additions = {
+        "coaching_principles": [
+            "Build consistency before adding intensity.",
+            "Use step-wise progression only after stable completion and manageable fatigue.",
+        ],
+        "decision_rules": [
+            "IF adherence is inconsistent THEN hold load steady and prioritize session completion before progressing intensity.",
+            "IF 2-3 weeks of stable completion and tolerable fatigue are achieved THEN add only one progression step at a time.",
+        ],
+        "constraints": [
+            "Do not add multiple progression changes in the same week for beginner or rebuilding riders.",
+        ],
+        "recovery_heuristics": [
+            "Use mostly easy riding and leave at least one low-stress day between more demanding sessions while rebuilding consistency.",
+        ],
+    }
+
+    for field_name, target_list in (
+        ("coaching_principles", principles),
+        ("decision_rules", decisions),
+        ("constraints", constraints),
+        ("recovery_heuristics", heuristics),
+    ):
+        for item in additions[field_name]:
+            if item not in target_list:
+                target_list.append(item)
+
+    enriched["coaching_principles"] = principles
+    enriched["decision_rules"] = decisions
+    enriched["constraints"] = constraints
+    enriched["recovery_heuristics"] = heuristics
+
+    low_resource = str(enriched.get("low_resource_applicability", "")).strip()
+    if "consistency" not in low_resource.lower():
+        extra = "Prioritize consistency, easy riding, and RPE-based step-wise progression before adding harder work."
+        enriched["low_resource_applicability"] = f"{low_resource} {extra}".strip() if low_resource else extra
+
+    practical = str(enriched.get("practical_application", "")).strip()
+    if "completion" not in practical.lower():
+        extra = "Start with simple weekly structure, prioritize completion, and progress only after stable adherence and recovery."
+        enriched["practical_application"] = f"{practical} {extra}".strip() if practical else extra
+
+    return enriched
 
 
 def _has_journal_signals(blob: str) -> bool:
@@ -1226,6 +1359,8 @@ def extract_metadata(text: str, priority: str, pdf_path: Path) -> dict:
         _log_failure_reason("fallback_metadata", f"{pdf_path.name}: no valid chunk metadata")
         return _build_fallback_metadata(pdf_path, priority)
 
+    aggregated = _enrich_beginner_foundation_metadata(aggregated)
+
     if str(aggregated.get("document_type", "")).strip().lower() not in VALID_DOCUMENT_TYPES:
         aggregated["document_type"] = "other"
 
@@ -1362,7 +1497,7 @@ date_added: {TODAY}
 
 # ─────────────────────────────────────────
 
-def process_pdf(pdf_path: Path, existing_rows: list) -> dict | None:
+def process_pdf(pdf_path: Path, existing_rows: list, id_floor: int = 0) -> dict | None:
 
     if not pdf_path.exists():
         _log_failure_reason("stale_file_reference", f"{pdf_path.name}: file missing before processing")
@@ -1426,7 +1561,7 @@ def process_pdf(pdf_path: Path, existing_rows: list) -> dict | None:
     print(f"  PDF moved to: PDF Processed/{pdf_rel_path}")
 
     # Generate Paper ID
-    paper_id = generate_paper_id(existing_rows)
+    paper_id = generate_paper_id(existing_rows, id_floor)
 
     # Save Markdown note
     notes_folder = NOTES_ROOT / domain / sub_topic
@@ -1536,6 +1671,7 @@ def main():
     NOTES_ROOT.mkdir(exist_ok=True)
 
     existing_rows = load_index()
+    id_floor = paper_id_floor()
 
     # Backfill pass for existing rows: rule-based type correction without PDF re-parse.
     existing_rows, backfill_review_rows, changed = reclassify_existing_rows(existing_rows)
@@ -1557,7 +1693,7 @@ def main():
 
     for pdf in pdfs:
         try:
-            row = process_pdf(pdf, existing_rows)
+            row = process_pdf(pdf, existing_rows, id_floor)
             if row:
                 existing_rows.append(row)
                 new_rows.append(row)

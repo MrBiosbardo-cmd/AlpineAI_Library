@@ -955,6 +955,9 @@ def detect_extraction_quality_issues(data: dict, pdf_path: Path) -> list[str]:
     """
     issues: list[str] = []
 
+    if not str(data.get("title", "")).strip() and str(data.get("main_finding", "")).strip():
+        issues.append("empty_title_despite_real_content")
+
     for field in _SCALAR_FIELDS_TO_CHECK:
         val = str(data.get(field, "")).strip()
         if val.lower() == "string":

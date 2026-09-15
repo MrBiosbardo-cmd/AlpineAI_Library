@@ -42,6 +42,7 @@ try:
         save_index,
         save_manual_review_queue,
         reclassify_existing_rows,
+        paper_id_floor,
         process_pdf,
     )
 except ImportError as exc:
@@ -87,6 +88,12 @@ def main():
     existing_rows = load_index()
     print(f"Existing index entries: {len(existing_rows)}")
 
+    # Durable high-water mark for Paper_ID numbering, independent of the
+    # current (possibly-trimmed) Master_Index.csv — prevents ID reuse when
+    # rows have been removed (e.g. by clear_for_reprocess.py) but the ID
+    # still shows up in old notes or the manual review queue.
+    id_floor = paper_id_floor()
+
     # Backfill: re-classify document types for already-indexed rows (no LLM call)
     existing_rows, backfill_review, changed = reclassify_existing_rows(existing_rows)
     if changed:
@@ -110,7 +117,7 @@ def main():
 
     for pdf_path in _progress(pdfs, desc="Processing PDFs", unit="pdf"):
         try:
-            row = process_pdf(pdf_path, existing_rows + new_rows)
+            row = process_pdf(pdf_path, existing_rows + new_rows, id_floor)
             if row is None:
                 continue  # already indexed or no text
 
